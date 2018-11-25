@@ -1,0 +1,200 @@
+#!/usr/bin/env python3.4
+
+import sys
+import argparse
+import ffmpeg
+
+def createMergeVideoParser():
+	parser = argparse.ArgumentParser(description = "Concatenate multimedia files (videos and photos) into one video file with crossfades/slideshows")
+	parser.add_argument('input', help = "input multimedia file list", nargs='*')
+	parser.add_argument('output', help = "result video file", nargs='?', default="compiltaion.mp4")
+	
+	parser.add_argument('-i', '--info', help = "print only information about input multimedia files (it doesn't create any video file)", action='store_true')
+	parser.add_argument('-f', '--final_fadeout', help = "duration of final fadeout (at the end of video)", metavar='duration', default=0, type=float)
+	parser.add_argument('-t', '--transition_duration', help = "value of transition duration between photos/videos", metavar='duration', default=3, type=float)
+	parser.add_argument('-m', '--image_duration', help = "value of image duration", metavar='duration', default=10, type=float)
+	parser.add_argument('-ow', '--output_width', help = "width of output video in pixels", metavar='width', default=1920, type=int)
+	parser.add_argument('-oh', '--output_height', help = "height of output video in pixels", metavar='height', default=1080, type=int)
+	
+	return parser
+
+def getMediaInfo(file_name, args):
+	try:
+		probe = ffmpeg.probe(file_name)
+	except ffmpeg.Error as e:
+		print(e.stderr, file=sys.stderr)
+		sys.exit(1)
+
+	video_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video'), None)
+	rotate = 0
+	if 'tags' in video_stream and 'rotate' in video_stream['tags']:
+		rotate = int(video_stream['tags']['rotate'])
+
+	return {'file_name' : file_name, 'is_image' : video_stream.get('codec_time_base', '0/1') == '0/1', 'width' : int(video_stream.get('width', args.output_width)), 
+		'height' : int(video_stream.get('height', args.output_height)), 'duration' : float(video_stream.get('duration', 0)), 'rotate' : rotate}
+
+def prepareFileList(args):
+	result = []
+	image_duration = float(args.image_duration)
+	transition_duration = float(args.transition_duration)
+	current_ts = float(0.0)
+	i = 0
+	for file_name in args.input:
+		media_info = getMediaInfo(file_name, args)
+		media_info['start_ts'] = current_ts
+
+		if media_info['is_image']:
+			current_ts += image_duration
+			media_info['duration'] = image_duration
+		else:
+			current_ts += media_info['duration']
+
+		if i != len(args.input) and i != 0:
+			current_ts -= transition_duration / 2.0
+		else:
+			current_ts -= transition_duration 
+
+		media_info['stop_ts'] = current_ts
+		i += 1
+		result.append(media_info)
+
+	return result
+
+def printInfo(file_list):
+	header = "|{file_name:^36}|{is_image:^10}|{width:^7}|{height:^8}|{start:^15}|{end:^15}|{duration:^19}|{rotate:^19}|".format(file_name="file name",
+	is_image="is image", width="width", height="height", start="start", end="end", duration="duration of video", rotate="rotate")
+	print("=" * len(header))
+	print(header)
+	print("=" * len(header))
+	for file_info in file_list:
+		print("|{file_name:>36}|{is_image:^10}|{width:^7}|{height:^8}|{start_ts:>15}|{stop_ts:>15}|{duration:>19}|{rotate:>19}|".format(
+		file_name=file_info['file_name'], is_image=file_info['is_image'], width=file_info['width'], height=file_info['height'], start_ts=file_info['start_ts'],
+		stop_ts=file_info['stop_ts'], duration=file_info['duration'], rotate=file_info['rotate']))
+	print("=" * len(header))
+
+def prepareStream(file_record, args):
+	stream = ffmpeg.input(file_record['file_name'])
+
+	video = stream['v'].filter('setsar', sar='1/1')
+	if file_record['is_image']:
+		video = video.filter('loop', loop=float(25 * args.image_duration), size=1, start=0)
+		audio = ffmpeg.input('anullsrc', t=float(args.image_duration), f='lavfi')
+	else:
+		audio = stream['a']
+
+	rotate = file_record['rotate']
+	while rotate > 0:
+		video = video.filter('transpose', dir='2')
+		rotate -= 90
+	video = video.filter('scale', w=int(args.output_width), h=int(args.output_height), force_original_aspect_ratio='decrease')
+	video = video.filter('pad',w=int(args.output_width), h=int(args.output_height), x='(ow-iw)/2', y='(oh-ih)/2') 
+
+	return (video, audio)
+
+def prepareStreams(file_list, args):
+	video_streams = []
+	audio_streams = []
+	for file_record in file_list:
+		video_in, audio_in = prepareStream(file_record, args)
+		video_streams += [video_in]
+		audio_streams += [audio_in]
+	return {'video' : video_streams, 'audio' : audio_streams}
+
+def streamsGen(streams, file_list):
+	number_of_items = min(len(streams['video']), len(streams['audio']), len(file_list))
+	prev_data = {}
+	for i, (video_stream, audio_stream, file_record) in enumerate(zip(streams['video'], streams['audio'], file_list)):
+		result = { 'first' : i == 0, 'last' : i == number_of_items - 1, 'video' : video_stream.filter_multi_output('split', 4), 'audio' : audio_stream.filter_multi_output('asplit', 4), 'duration' : file_record['duration']}
+		if (i != 0):
+			result['prev_video'] = prev_data['video']
+			result['prev_audio'] = prev_data['audio']
+			result['prev_duration'] = prev_data['duration']
+		prev_data = result
+		yield result
+
+def trimLeft(video_stream, audio_stream, duration, trim_duration):
+	out_video = video_stream.trim(start=trim_duration).setpts('PTS-STARTPTS')
+	out_audio = audio_stream.filter('atrim', start=trim_duration).filter('asetpts','PTS-STARTPTS')
+	return (out_video, out_audio)
+
+def trimRight(video_stream, audio_stream, duration, crossfade_duration):
+	out_video = video_stream.trim(end=duration - crossfade_duration)
+	out_audio = audio_stream.filter('atrim', end=duration - crossfade_duration)
+	return (out_video, out_audio)
+	
+def crossTransition(video_streamA, audio_streamA, durationA, video_streamB, audio_streamB, durationB, crossfade_duration):
+	videoA, audioA = trimLeft(video_streamA, audio_streamA, durationA, durationA - crossfade_duration)
+	videoB, audioB = trimRight(video_streamB, audio_streamB, durationB, durationB - crossfade_duration)
+
+	video_stream = ffmpeg.filter([videoA, videoB], "blend", all_expr='B*(if(gte(T,{0}),1,T/{0}))+A*(1-(if(gte(T,{0}),1,T/{0})))'.format(crossfade_duration))
+
+	audioA = audioA.filter('afade', t='out', curve='log', d=crossfade_duration)
+	audioB = audioB.filter('afade', t='in', curve='log', d=crossfade_duration)
+	audio_stream = ffmpeg.filter([audioA, audioB], 'amix', duration='first', dropout_transition=1)
+
+	return (video_stream, audio_stream)
+
+def finalCrossfade(video_stream, audio_stream, duration, finalcrossfade_duration):
+	video, audio = trimLeft(video_stream, audio_stream, duration, duration - finalcrossfade_duration)
+	video = video.filter("fade", t='out', d=finalcrossfade_duration)
+	audio = audio.filter('afade', t='out', curve='exp', d=finalcrossfade_duration)
+	return (video, audio)
+
+def createTransitions(streams, file_list, args):
+	video_streams = []
+	audio_streams = []
+	generator = streamsGen(streams, file_list)
+	crossfade_duration = args.transition_duration
+	for i, item in enumerate(generator):
+		duration, durationB = (item['duration'], item['duration'])
+		video = item['video'].stream(4*i)
+		audio = item['audio'].stream(4*i)
+		if not item['first']:
+			durationA = item['prev_duration']
+			cross_videoA, cross_videoB = (item['prev_video'].stream(4*i + 2), item['video'].stream(4*i + 1))
+			cross_audioA, cross_audioB = (item['prev_audio'].stream(4*i + 2), item['audio'].stream(4*i + 1))
+
+		if not item['first']:
+			cross_video, cross_audio = crossTransition(cross_videoA, cross_audioA, durationA, cross_videoB, cross_audioB, durationB, crossfade_duration)
+			video, audio = trimLeft(video, audio, duration, crossfade_duration)
+			duration-=crossfade_duration			
+			video_streams += [cross_video]
+			audio_streams += [cross_audio]
+
+		if item['last'] and args.final_fadeout > 0:
+			video, audio = trimRight(video, audio, duration, args.final_fadeout)
+			video_streams += [video]
+			audio_streams += [audio]
+			video, audio = finalCrossfade(item['video'].stream(4*i+3), item['audio'].stream(4*i+3), durationB, args.final_fadeout)
+		else:
+			video, audio = trimRight(video, audio, duration, crossfade_duration)
+
+		video_streams += [video]
+		audio_streams += [audio]
+
+	return {'video' : video_streams, 'audio' : audio_streams}
+
+def concatenate(streams):
+	overlapped_streams = []
+	for a,b in zip(streams['video'], streams['audio']):
+		overlapped_streams += [a, b]
+
+	out = ffmpeg.concat(*overlapped_streams, v=1, a=1).output(args.output)
+	print(out.get_args())
+	try:
+		out.run()
+	except ffmpeg.Error as e:
+		print(e.stderr, file=sys.stderr)
+		sys.exit(1)
+
+parser = createMergeVideoParser()
+args = parser.parse_args()
+file_list = prepareFileList(args)
+
+if args.info:
+	printInfo(file_list)
+	sys.exit(1)
+
+streams = prepareStreams(file_list, args)
+transitioned_streams = createTransitions(streams, file_list, args)
+concatenate(transitioned_streams)
